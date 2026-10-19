@@ -1,0 +1,215 @@
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
+
+from __future__ import annotations
+
+import math
+from typing import TYPE_CHECKING
+
+import torch
+import torch.nn as nn
+from einops import rearrange, repeat
+
+from fla.layers.utils import get_layer_cache, repad_hidden_states, unpad_hidden_states, update_layer_cache
+from fla.modules import RMSNorm
+from fla.modules.activations import elu_p1
+from fla.modules.feature_map import DPFPFeatureMap, HadamardFeatureMap, HedgehogFeatureMap, T2RFeatureMap
+from fla.ops.linear_attn import chunk_linear_attn, fused_chunk_linear_attn, fused_recurrent_linear_attn
+
+if TYPE_CHECKING:
+    from fla.models.utils import Cache
+
+
+class LinearAttention(nn.Module):
+
+    def __init__(
+        self,
+        mode: str = 'chunk',
+        hidden_size: str = 1024,
+        expand_k: float = 1.0,
+        expand_v: float = 1.0,
+        num_heads: int = 8,
+        num_kv_heads: int | None = None,
+        feature_map: str = 'elementwise_product',
+        tie_feature_map_qk: bool = False,
+        output_norm: str = 'rmsnorm',
+        norm_q: bool = False,
+        norm_k: bool = False,
+        do_feature_map_norm: bool = False,
+        elementwise_affine: bool = True,
+        norm_eps: float = 1e-5,
+        layer_idx: int | None = None,
+        **kwargs,
+    ):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.mode = mode
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        assert self.num_heads % self.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        key_dim, value_dim = hidden_size * expand_k, hidden_size * expand_v
+        self.key_dim, self.value_dim = round(key_dim), round(value_dim)
+        assert math.isclose(key_dim, self.key_dim), f"`hidden_size * expand_k` must be an integer, got {key_dim}."
+        assert math.isclose(value_dim, self.value_dim), f"`hidden_size * expand_v` must be an integer, got {value_dim}."
+        self.key_dim_per_group = self.key_dim // self.num_kv_groups
+        self.value_dim_per_group = self.value_dim // self.num_kv_groups
+
+        assert mode in ['chunk', 'fused_chunk', 'fused_recurrent'], f"Not supported mode `{mode}`."
+        assert self.key_dim % num_heads == 0, f"key dim must be divisible by num_heads of {num_heads}"
+        assert self.value_dim % num_heads == 0, f"value dim must be divisible by num_heads of {num_heads}"
+
+        self.head_k_dim = self.key_dim // num_heads
+        self.head_v_dim = self.value_dim // num_heads
+        self.do_feature_map_norm = do_feature_map_norm
+        self.layer_idx = layer_idx
+
+        if feature_map == 'hedgehog':
+            if tie_feature_map_qk:
+                self.feature_map_q = self.feature_map_k = HedgehogFeatureMap(head_dim=self.head_k_dim)
+            else:
+                self.feature_map_q = HedgehogFeatureMap(head_dim=self.head_k_dim)
+                self.feature_map_k = HedgehogFeatureMap(head_dim=self.head_k_dim)
+
+        elif feature_map == 't2r':
+            if tie_feature_map_qk:
+                self.feature_map_q = self.feature_map_k = T2RFeatureMap(head_dim=self.head_k_dim)
+            else:
+                self.feature_map_q = T2RFeatureMap(head_dim=self.head_k_dim)
+                self.feature_map_k = T2RFeatureMap(head_dim=self.head_k_dim)
+
+        elif feature_map == 'elementwise_product':
+            if tie_feature_map_qk:
+                self.feature_map_q = self.feature_map_k = HadamardFeatureMap(head_dim=self.head_k_dim)
+            else:
+                self.feature_map_q = HadamardFeatureMap(head_dim=self.head_k_dim)
+                self.feature_map_k = HadamardFeatureMap(head_dim=self.head_k_dim)
+
+        elif feature_map == 'dpfp':
+            self.feature_map_q = DPFPFeatureMap(head_dim=self.head_k_dim)
+            self.feature_map_k = DPFPFeatureMap(head_dim=self.head_k_dim)
+
+        elif feature_map == 'elu':
+            self.feature_map_q = elu_p1
+            self.feature_map_k = elu_p1
+
+        elif feature_map == 'relu':
+            self.feature_map_q = nn.ReLU()
+            self.feature_map_k = nn.ReLU()
+
+        elif feature_map == 'identity':
+            self.feature_map_q = nn.Identity()
+            self.feature_map_k = nn.Identity()
+        else:
+            raise NotImplementedError(f"Not supported feature map `{feature_map}`.")
+
+        self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, self.key_dim_per_group, bias=False)
+        self.v_proj = nn.Linear(hidden_size, self.value_dim_per_group, bias=False)
+
+        if output_norm == 'rmsnorm':
+            self.norm = RMSNorm(hidden_size=self.head_v_dim, elementwise_affine=elementwise_affine,
+                                eps=norm_eps, dtype=torch.float32)
+        elif output_norm == 'identity':
+            self.norm = nn.Identity()
+        else:
+            raise NotImplementedError(f"Not supported output norm `{output_norm}`.")
+
+        self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
+
+        self.norm_q = norm_q
+        self.norm_k = norm_k
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        output_attentions: bool | None = False,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
+        if attention_mask is not None:
+            assert attention_mask.ndim == 2, 'Expected attention_mask with shape [batch_size, seq_len].'
+        batch_size, q_len, _ = hidden_states.shape
+        # Match other recurrent layers: use the recurrent kernel for decode/small chunks.
+        if torch.is_grad_enabled():
+            mode = 'chunk'
+        elif hidden_states.shape[1] <= 64:
+            mode = 'fused_recurrent'
+        else:
+            mode = self.mode
+        last_state = get_layer_cache(self, past_key_values)
+        cu_seqlens = kwargs.get('cu_seqlens')
+        hidden_states, indices, cu_seqlens = unpad_hidden_states(hidden_states, cu_seqlens, attention_mask, q_len)
+
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
+        q = rearrange(q, '... (h d) -> ... h d', d=self.head_k_dim)
+        if self.num_kv_groups > 1:
+            k = repeat(k, '... (h d) -> ... (h g) d', d=self.head_k_dim, g=self.num_kv_groups)
+            v = repeat(v, '... (h d) -> ... (h g) d', d=self.head_v_dim, g=self.num_kv_groups)
+        else:
+            k = rearrange(k, '... (h d) -> ... h d', d=self.head_k_dim)
+            v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
+
+        q = self.feature_map_q(q)
+        k = self.feature_map_k(k)
+
+        if self.norm_q:
+            q = q / (q.sum(-1, True) + 1e-4)
+        if self.norm_k:
+            k = k / (k.sum(-1, True) + 1e-4)
+
+        recurrent_state = last_state['recurrent_state'] if last_state is not None else None
+        if mode == 'chunk':
+            o, final_state = chunk_linear_attn(
+                q=q,
+                k=k,
+                v=v,
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
+                normalize=self.do_feature_map_norm,
+                cu_seqlens=cu_seqlens,
+            )
+        elif mode == 'fused_chunk':
+            o, final_state = fused_chunk_linear_attn(
+                q=q,
+                k=k,
+                v=v,
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
+                normalize=self.do_feature_map_norm,
+                cu_seqlens=cu_seqlens,
+            )
+        elif mode == 'fused_recurrent':
+            o, final_state = fused_recurrent_linear_attn(
+                q=q,
+                k=k,
+                v=v,
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
+                normalize=self.do_feature_map_norm,
+                cu_seqlens=cu_seqlens,
+            )
+        else:
+            raise NotImplementedError
+        update_layer_cache(
+            self,
+            past_key_values,
+            recurrent_state=final_state,
+            offset=q_len,
+        )
+        # keep fully masked batches nonempty for output normalization
+        o = repad_hidden_states(o, indices, batch_size, q_len)
+        o = self.norm(o)
+        o = rearrange(o, '... h d -> ... (h d)')
+        o = self.o_proj(o)
+        return o, None, past_key_values

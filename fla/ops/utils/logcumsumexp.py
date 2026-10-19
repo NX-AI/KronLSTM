@@ -1,0 +1,60 @@
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
+
+import triton
+import triton.language as tl
+
+from fla.ops.utils.op import exp, log
+from fla.utils import autotune_cache_kwargs
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BT': BT}, num_warps=num_warps)
+        for BT in [16, 32, 64]
+        for num_warps in [2, 4, 8]
+    ],
+    key=['S'],
+    **autotune_cache_kwargs,
+)
+@triton.jit(do_not_specialize=['T'])
+def logcumsumexp_fwd_kernel(
+    s,
+    z,
+    T,
+    S: tl.constexpr,
+    BT: tl.constexpr,
+):
+    i_bh = tl.program_id(0).to(tl.int64)
+    o_i = tl.arange(0, BT)
+    m_s = tl.where(o_i[:, None] >= o_i[None, :], 1., 0.)
+
+    b_mp = tl.full([S], float('-inf'), dtype=tl.float32)
+    b_zp = tl.zeros([S], dtype=tl.float32)
+    for i_t in range(tl.cdiv(T, BT)):
+        o_t = i_t * BT + tl.arange(0, BT)
+        m_t = o_t < T
+        p_s = s + i_bh * T*S + o_t[:, None] * S + tl.arange(0, S)[None, :]
+        p_z = z + i_bh * T*S + o_t[:, None] * S + tl.arange(0, S)[None, :]
+
+        # [BT, S]
+        b_s = tl.load(p_s, mask=m_t[:, None], other=0.0).to(tl.float32)
+        # [S,]
+        b_mc = tl.max(b_s, 0)
+        b_mc = tl.maximum(b_mp, b_mc)
+        b_zp = b_zp * exp(b_mp - b_mc)
+        # [BT, S]
+        b_s = exp(b_s - b_mc)
+        b_z = tl.dot(m_s, b_s, allow_tf32=False) + b_zp
+        # [S,]
+        b_zc = tl.max(b_z, 0)
+        b_mp = b_mc
+        b_zp = b_zc
+        # [BT, BS]
+        # small eps to prevent underflows
+        b_z = log(tl.where(b_z != 0, b_z, 1e-20)) + b_mc
+        tl.store(p_z, b_z.to(p_z.dtype.element_ty), mask=m_t[:, None])

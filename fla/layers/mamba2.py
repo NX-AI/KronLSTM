@@ -1,0 +1,707 @@
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
+
+from __future__ import annotations
+
+import math
+import warnings
+from typing import TYPE_CHECKING
+
+import torch
+import torch.nn as nn
+from einops import rearrange
+from transformers.utils import logging
+
+from fla.layers.utils import get_layer_cache, update_layer_cache
+from fla.modules.activations import ACT2FN
+from fla.modules.layernorm_gated import RMSNormGated
+
+with warnings.catch_warnings():
+    warnings.simplefilter('ignore')
+    try:
+        from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+        from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined
+    except ImportError:
+        selective_state_update, mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined = None, None, None
+    try:
+        from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    except ImportError:
+        causal_conv1d_update, causal_conv1d_fn = None, None
+    is_fast_path_available = selective_state_update is not None
+
+if TYPE_CHECKING:
+    from fla.models.utils import Cache
+
+logger = logging.get_logger(__name__)
+
+
+def apply_mask_to_padding_states(hidden_states, attention_mask):
+    """
+    Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
+    """
+    if attention_mask is not None and attention_mask.shape == hidden_states.shape[:2]:
+        dtype = hidden_states.dtype
+        hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+
+    return hidden_states
+
+
+def pad_tensor_by_size(input_tensor: torch.Tensor, pad_size: int):
+    """
+    Padding x tensor with `pad_size` on the seq_len dim (dim=1)
+
+    Assumes that we only have tensors of either size 4 or 3
+    """
+    pad_shape = (0, 0, 0, 0, 0, pad_size, 0, 0) if len(input_tensor.shape) == 4 else (0, 0, 0, pad_size, 0, 0)
+
+    return torch.nn.functional.pad(input_tensor, pad_shape, mode="constant", value=0)
+
+
+def reshape_into_chunks(input_tensor, pad_size, chunk_size):
+    """
+    Padding input_tensor with `pad_size` on the seq_len dim (dim=1) and
+    simultaneously splitting it into chunk sequences.
+
+    Assumes that we only have tensors of either size 4 or 3
+    """
+    # [bsz, seq_len, ...] -> [bsz, seq_len multiple of chunk_size, ...]
+    input_tensor = pad_tensor_by_size(input_tensor, pad_size)
+
+    if len(input_tensor.shape) == 3:
+        # [bsz, seq_len multiple of chunk_size, num_heads] -> [bsz, -1, chunk_size, num_heads]
+        return input_tensor.reshape(input_tensor.shape[0], -1, chunk_size, input_tensor.shape[2])
+    else:
+        # [bsz, seq_len multiple of chunk_size, num_heads, head_dim or state_size] ->
+        # [bsz, -1, chunk_size, num_heads, head_dim or state_size]
+        return input_tensor.reshape(
+            input_tensor.shape[0], -1, chunk_size, input_tensor.shape[2], input_tensor.shape[3],
+        )
+
+
+def segment_sum(input_tensor):
+    """
+    More stable segment sum calculation. Uses cumulative sums and masking instead of direct subtractions.
+    """
+    chunk_size = input_tensor.size(-1)
+    # 1. expand input tensor to have an additional dimension and repeat along that dimension
+    # [..., chunk_size] -> [..., chunk_size, chunk_size]
+    input_tensor = input_tensor[..., None].expand(*input_tensor.size(), chunk_size)
+    # 2. create a lower triangular mask with the diagonal set to 0 to 0 out elements above diag
+    mask = torch.tril(torch.ones(chunk_size, chunk_size, device=input_tensor.device, dtype=torch.bool), diagonal=-1)
+    input_tensor = input_tensor.masked_fill(~mask, 0)
+    # 3. compute actual cumsum
+    tensor_segsum = torch.cumsum(input_tensor, dim=-2)
+
+    # 4. apply mask to keep only the lower triangular part of the cumulative sum result (incl diagonal this time)
+    mask = torch.tril(torch.ones(chunk_size, chunk_size, device=input_tensor.device, dtype=torch.bool), diagonal=0)
+    tensor_segsum = tensor_segsum.masked_fill(~mask, -torch.inf)
+    return tensor_segsum
+
+
+class Mamba2(nn.Module):
+    """
+    Compute ∆, A, B, C, and D the state space parameters and compute the `contextualized_states`.
+    A, D are input independent (see Mamba paper [1] Section 3.5.2 "Interpretation of A" for why A isn't selective)
+    ∆, B, C are input-dependent (this is a key difference between Mamba and the linear time invariant S4,
+    and is why Mamba is called **selective** state spaces)
+    """
+
+    def __init__(
+        self,
+        num_heads: int | None = None,
+        head_dim: int = 64,
+        hidden_size: int = 2048,
+        state_size: int = 128,
+        expand: int = 2,
+        n_groups: int = 1,
+        conv_kernel: int = 4,
+        conv_init: float | None = None,
+        use_conv_bias: bool = True,
+        hidden_act: str = "silu",
+        A_init_range: tuple[float, float] = (1, 16),
+        D_has_hdim: bool = False,
+        rmsnorm: bool = True,
+        norm_before_gate: bool = False,
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        dt_init_floor: float = 1e-4,
+        dt_limit: tuple[float, float] = (0.0, float("inf")),
+        use_bias: bool = False,
+        norm_eps: float = 1e-5,
+        chunk_size: int = 256,
+        layer_idx: int | None = None,
+        backend: str = "cuda",
+    ) -> Mamba2:
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.expand = expand
+        self.intermediate_size = int(expand * hidden_size)
+        self.head_dim = head_dim
+        self.ssm_state_size = state_size
+        self.n_groups = n_groups
+
+        if self.intermediate_size % head_dim != 0:
+            raise ValueError(
+                f"`expand * hidden_size` ({self.intermediate_size}) must be divisible by `head_dim` ({head_dim})."
+            )
+        inferred_num_heads = self.intermediate_size // head_dim
+        if num_heads is None or num_heads == 0:
+            self.num_heads = inferred_num_heads
+        else:
+            if num_heads != inferred_num_heads:
+                raise ValueError(
+                    f"`num_heads * head_dim` ({num_heads * head_dim}) must equal "
+                    f"`expand * hidden_size` ({self.intermediate_size})."
+                )
+            self.num_heads = num_heads
+
+        if self.num_heads % n_groups != 0:
+            raise ValueError(
+                f"`num_heads` ({self.num_heads}) must be divisible by `n_groups` ({n_groups})."
+            )
+
+        self.conv_kernel_size = conv_kernel
+        self.conv_init = conv_init
+        self.use_conv_bias = use_conv_bias
+        self.activation = hidden_act
+        self.act = ACT2FN[hidden_act]
+
+        self.A_init_range = A_init_range
+        self.D_has_hdim = D_has_hdim
+        self.rmsnorm = rmsnorm
+        self.norm_before_gate = norm_before_gate
+        self.norm_eps = norm_eps
+
+        self.chunk_size = chunk_size
+
+        self.dt_limit = dt_limit
+        self.dt_min = dt_min
+        self.dt_max = dt_max
+
+        self.conv_dim = self.intermediate_size + 2 * self.n_groups * self.ssm_state_size
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            bias=use_conv_bias,
+            kernel_size=conv_kernel,
+            groups=self.conv_dim,
+            padding=conv_kernel - 1,
+        )
+        if self.conv_init is not None:
+            nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+
+        # projection of the input hidden states
+        projection_size = self.intermediate_size + self.conv_dim + self.num_heads
+        self.in_proj = nn.Linear(
+            self.hidden_size,
+            projection_size,
+            bias=use_bias,
+        )
+        # selective projection used to make dt, B and C input-dependent
+
+        # time step projection (discretization)
+        # instantiate once and copy inv_dt in init_weights of PretrainedModel
+        # hard coded for now
+        dt = torch.exp(
+            torch.rand(self.num_heads) * (
+                math.log(self.dt_max) - math.log(self.dt_min)
+            ) + math.log(self.dt_min)
+        )
+        dt = torch.clamp(dt, min=dt_init_floor)
+        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        self.dt_bias = nn.Parameter(inv_dt)
+        self.dt_bias._no_weight_decay = True
+
+        # S4D real initialization. These are not discretized!
+        # The core is to load them, compute the discrete states, then write the updated state. Keeps the memory bounded
+        A = torch.empty(self.num_heads, dtype=torch.float32).uniform_(*self.A_init_range)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True
+        self.norm = None
+        if self.rmsnorm:
+            self.norm = RMSNormGated(
+                self.intermediate_size,
+                eps=self.norm_eps,
+                norm_before_gate=self.norm_before_gate,
+                group_size=self.intermediate_size // n_groups
+            )
+        self.D = nn.Parameter(torch.ones(self.intermediate_size if self.D_has_hdim else self.num_heads))
+        self.D._no_weight_decay = True
+
+        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=use_bias)
+        self.use_bias = use_bias
+
+        self.layer_idx = layer_idx
+
+        if not is_fast_path_available:
+            logger.warning_once(
+                "The fast path is not available because one of "
+                "`(selective_state_update)` is None. "
+                "Falling back to the naive implementation. "
+                "To install follow https://github.com/state-spaces/mamba/#installation",
+            )
+        import os
+        backend = os.environ.get('FLA_CONV_BACKEND', backend)
+        assert backend in ['cuda', 'triton'], f"Unsupported backend: {backend}"
+        if backend == 'cuda' and causal_conv1d_fn is None:
+            logger.warning_once(
+                "The CUDA backend is not available because `causal_conv1d` is None. "
+                "Falling back to the Triton backend. "
+                "To install follow https://github.com/Dao-AILab/causal-conv1d",
+            )
+            backend = 'triton'
+        if backend == 'triton':
+            from fla.modules.convolution import causal_conv1d as causal_conv1d_triton
+            from fla.modules.convolution import causal_conv1d_update as causal_conv1d_update_triton
+            self.causal_conv1d_fn = causal_conv1d_triton
+            self.causal_conv1d_update = causal_conv1d_update_triton
+            logger.warning(
+                "Mamba2 does not recommend using Triton's conv1d backend, "
+                "as it is untested and may contain bugs.",
+            )
+        else:
+            self.causal_conv1d_fn = causal_conv1d_fn
+            self.causal_conv1d_update = causal_conv1d_update
+        self.backend = backend
+
+    def _get_D(self, expand_to_head_dim: bool = False) -> torch.Tensor:
+        if self.D_has_hdim:
+            return rearrange(self.D, "(h p) -> h p", p=self.head_dim)
+        if expand_to_head_dim:
+            return self.D[:, None].expand(-1, self.head_dim)
+        return self.D
+
+    def cuda_kernels_forward(
+        self,
+        hidden_states: torch.Tensor,
+        last_state: dict | None = None,
+        use_cache: bool = False,
+        attention_mask: torch.Tensor | None = None,
+    ):
+        # 1. Gated MLP's linear projection
+        projected_states = self.in_proj(hidden_states)
+
+        # Set up dimensions for reshapes later
+        batch_size, seq_len, _ = hidden_states.shape
+        groups_time_state_size = self.n_groups * self.ssm_state_size
+        d_mlp = (
+            projected_states.shape[-1]
+            - 2 * self.intermediate_size
+            - 2 * self.n_groups * self.ssm_state_size
+            - self.num_heads
+        ) // 2
+
+        # Single step calculations via cache (decode)
+        if last_state is not None:
+            if hidden_states.shape[1] != 1:
+                raise ValueError("Mamba2 cached decoding only supports a single new token per step.")
+            conv_state = last_state['conv_state']
+            ssm_state = last_state['recurrent_state']
+
+            _, _, gate, hidden_states_B_C, dt = projected_states.squeeze(1).split(
+                [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads], dim=-1,
+            )
+
+            # 2. Convolution sequence transformation
+            hidden_states_B_C = self.causal_conv1d_update(
+                hidden_states_B_C.contiguous(),
+                conv_state,
+                self.conv1d.weight.squeeze(1),
+                self.conv1d.bias,
+                self.activation,
+            )
+
+            hidden_states, B, C = torch.split(
+                hidden_states_B_C,
+                [
+                    self.intermediate_size,
+                    groups_time_state_size,
+                    groups_time_state_size,
+                ],
+                dim=-1,
+            )
+
+            # 3. SSM transformation
+            A = -torch.exp(self.A_log.float())  # (nheads,)
+            A = A[:, None, ...][:, :, None].expand(-1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
+            dt = dt[:, :, None].expand(-1, -1, self.head_dim)
+            dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
+            D = self._get_D(expand_to_head_dim=True)
+            B = B.view(batch_size, self.n_groups, B.shape[1] // self.n_groups)
+            C = C.view(batch_size, self.n_groups, C.shape[1] // self.n_groups)
+            hidden_states_reshaped = hidden_states.view(batch_size, self.num_heads, self.head_dim)
+
+            hidden_states = selective_state_update(
+                ssm_state,
+                hidden_states_reshaped,
+                dt,
+                A,
+                B,
+                C,
+                D,
+                z=None if self.rmsnorm else gate.view(batch_size, self.num_heads, self.head_dim),
+                dt_bias=dt_bias,
+                dt_softplus=True,
+            )
+            hidden_states = hidden_states.view(batch_size, self.num_heads * self.head_dim)
+            if self.rmsnorm:
+                hidden_states = self.norm(hidden_states, gate)
+
+            # 4. Final linear projection
+            out = self.out_proj(hidden_states)[:, None, ...]
+
+            # conv_state is updated in-place by causal_conv1d_update
+            # ssm_state is updated in-place by selective_state_update
+            return out, conv_state, ssm_state
+
+        # Fused calculations or step by step if no initialized cache is found (prefill)
+        else:
+            A = -torch.exp(self.A_log.float())  # (num_heads) or (intermediate_size, state_size)
+            dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else {"dt_limit": self.dt_limit}
+
+            # 2-4. Fused kernel for conv1d, SSM, and the final projection
+            if self.training and not use_cache:
+                out = mamba_split_conv1d_scan_combined(
+                    projected_states,
+                    self.conv1d.weight.squeeze(1),
+                    self.conv1d.bias,
+                    self.dt_bias,
+                    A,
+                    D=self._get_D(),
+                    chunk_size=self.chunk_size,
+                    seq_idx=None,  # was seq_idx
+                    activation=self.activation,
+                    rmsnorm_weight=self.norm.weight if self.rmsnorm else None,
+                    rmsnorm_eps=self.norm.eps if self.rmsnorm else 1e-6,
+                    outproj_weight=self.out_proj.weight,
+                    outproj_bias=self.out_proj.bias,
+                    headdim=None if self.D_has_hdim else self.head_dim,
+                    ngroups=self.n_groups,
+                    norm_before_gate=self.norm_before_gate,
+                    return_final_states=False,
+                    **dt_limit_kwargs,
+                )
+                return out, None, None
+
+            else:
+                _, _, gate, hidden_states_B_C, dt = projected_states.split(
+                    [d_mlp, d_mlp, self.intermediate_size, self.conv_dim, self.num_heads], dim=-1,
+                )
+
+                # 2. Convolution sequence transformation
+                hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, attention_mask)
+                # Compute conv_state for cache
+                new_conv_state = None
+                if use_cache:
+                    hidden_states_B_C_transposed = hidden_states_B_C.transpose(1, 2)
+                    new_conv_state = nn.functional.pad(
+                        hidden_states_B_C_transposed,
+                        (self.conv_kernel_size - hidden_states_B_C_transposed.shape[-1], 0),
+                    )
+
+                if self.activation not in ["silu", "swish"]:
+                    hidden_states_B_C = self.act(
+                        self.conv1d(hidden_states_B_C.transpose(1, 2))[..., :seq_len].transpose(1, 2),
+                    )
+                else:
+                    _conv1d_output = self.causal_conv1d_fn(
+                        x=hidden_states_B_C.transpose(1, 2).contiguous(),
+                        weight=self.conv1d.weight.squeeze(1),
+                        bias=self.conv1d.bias,
+                        activation=self.activation,
+                    )
+                    if self.backend == 'cuda':
+                        hidden_states_B_C = _conv1d_output
+                        hidden_states_B_C = hidden_states_B_C.transpose(1, 2)
+                    elif self.backend == 'triton':
+                        hidden_states_B_C, _ = _conv1d_output
+                        hidden_states_B_C = hidden_states_B_C.transpose(1, 2).contiguous()
+                    else:
+                        raise ValueError(f"Unsupported backend: {self.backend}")
+
+                hidden_states_B_C = (hidden_states_B_C * attention_mask[:, :, None]).to(hidden_states_B_C.dtype) \
+                    if attention_mask is not None and attention_mask.shape == hidden_states_B_C.shape[:2] \
+                    else hidden_states_B_C
+                hidden_states, B, C = torch.split(
+                    hidden_states_B_C,
+                    [self.intermediate_size, groups_time_state_size, groups_time_state_size],
+                    dim=-1,
+                )
+
+                # 3. SSM transformation
+                scan_output, ssm_state = mamba_chunk_scan_combined(
+                    hidden_states.view(batch_size, seq_len, -1, self.head_dim),
+                    dt,
+                    A,
+                    B.view(batch_size, seq_len, self.n_groups, -1),
+                    C.view(batch_size, seq_len, self.n_groups, -1),
+                    chunk_size=self.chunk_size,
+                    D=self._get_D(),
+                    z=None if self.rmsnorm else gate.view(batch_size, seq_len, self.num_heads, self.head_dim),
+                    seq_idx=None,
+                    return_final_states=True,
+                    dt_bias=self.dt_bias,
+                    dt_softplus=True,
+                    **dt_limit_kwargs,
+                )
+
+                scan_output = scan_output.view(batch_size, seq_len, -1)
+                # Multiply "gate" branch and apply extra normalization layer
+                if self.rmsnorm:
+                    scan_output = self.norm(scan_output, gate)
+
+                # 4. Final linear projection
+                out = self.out_proj(scan_output)
+
+                return out, new_conv_state, ssm_state
+
+    # fmt: off
+    def torch_forward(
+        self,
+        input_states,
+        last_state: dict | None = None,
+        use_cache: bool = False,
+        attention_mask: torch.Tensor | None = None,
+    ):
+        batch_size, seq_len, _ = input_states.shape
+        dtype = input_states.dtype
+
+        # 1. Gated MLP's linear projection
+        projected_states = self.in_proj(input_states)
+        d_mlp = (projected_states.shape[-1] - 2 * self.intermediate_size -
+                 2 * self.n_groups * self.ssm_state_size - self.num_heads) // 2
+        _, _, gate, hidden_states_B_C, dt = projected_states.split(
+            [d_mlp, d_mlp, self.intermediate_size,  self.conv_dim, self.num_heads], dim=-1,
+        )
+
+        # 2. Convolution sequence transformation
+        if last_state is not None:
+            if input_states.shape[1] != 1:
+                raise ValueError("Mamba2 cached decoding only supports a single new token per step.")
+            # Decode path: single-step update
+            conv_state = last_state['conv_state']
+            ssm_state = last_state['recurrent_state']
+
+            conv_state = conv_state.roll(shifts=-1, dims=-1)
+            conv_state[:, :, -1] = hidden_states_B_C[:, 0, :].to(conv_state.device)
+
+            # We need to guarantee that anything regarding the cache is on the same device
+            conv_states_for_compute = conv_state.to(device=self.conv1d.weight.device)
+
+            hidden_states_B_C = torch.sum(
+                conv_states_for_compute * self.conv1d.weight.squeeze(1), dim=-1,
+            )
+            if self.use_conv_bias:
+                hidden_states_B_C = hidden_states_B_C + self.conv1d.bias
+            hidden_states_B_C = self.act(hidden_states_B_C)
+        else:
+            # Prefill path
+            hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, attention_mask)
+            new_conv_state = None
+            if use_cache:
+                hidden_states_B_C_transposed = hidden_states_B_C.transpose(1, 2)
+                new_conv_state = nn.functional.pad(
+                    hidden_states_B_C_transposed, (self.conv_kernel_size - hidden_states_B_C_transposed.shape[-1], 0),
+                )
+
+            hidden_states_B_C = self.act(self.conv1d(hidden_states_B_C.transpose(1, 2))[..., :seq_len].transpose(1, 2))
+
+        if last_state is None:
+            hidden_states_B_C = (hidden_states_B_C * attention_mask[:, :, None]).to(hidden_states_B_C.dtype) \
+                if attention_mask is not None and attention_mask.shape == hidden_states_B_C.shape[:2] \
+                else hidden_states_B_C
+        hidden_states, B, C = torch.split(
+            hidden_states_B_C,
+            [self.intermediate_size, self.n_groups * self.ssm_state_size, self.n_groups * self.ssm_state_size],
+            dim=-1,
+        )
+
+        # 3. SSM transformation
+        A = -torch.exp(self.A_log.float())                            # [num_heads]
+        if last_state is not None:
+            # Decode path
+            cache_device = ssm_state.device
+
+            # Note: there is no need to pad parameter matrices here, as there is just one new token
+            # for batched generation
+            dt = dt[:, 0, :][:, None, ...]
+            dt = dt.transpose(1, 2).expand(batch_size, dt.shape[-1], self.head_dim)
+            # [num_heads] -> [num_heads, head_dim]
+            dt_bias = self.dt_bias[..., None].expand(self.dt_bias.shape[0], self.head_dim)
+
+            dt = torch.nn.functional.softplus(dt + dt_bias.to(dt.dtype))
+            dt = torch.clamp(dt, self.dt_limit[0], self.dt_limit[1])
+            A = A[..., None, None].expand(self.num_heads, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
+            # [bsz, num_heads, head_dim, state_size]
+            dA = (torch.exp(dt[..., None] * A)).to(device=cache_device)
+
+            # Discretize B
+            # [bsz, n_groups * state_size] -> [bsz, n_groups, 1, state_size] ->
+            # -> [bsz, n_groups, group to head repetition factor, state_size] -> [bsz, num_heads, state_size]
+            B = B.reshape(batch_size, self.n_groups, -1)[..., None, :]
+            B = B.expand(batch_size, self.n_groups, self.num_heads // self.n_groups, B.shape[-1]).contiguous()
+            B = B.reshape(batch_size, -1, B.shape[-1])
+            # [bsz, num_heads, head_dim, state_size]
+            dB = dt[..., None] * B[..., None, :]
+
+            # Discretize x into dB
+            # [bsz, intermediate_size] -> [bsz, num_heads, head_dim]
+            hidden_states = hidden_states.reshape(batch_size, -1, self.head_dim)
+            dBx = (dB * hidden_states[..., None]).to(device=cache_device)
+
+            # State calculation
+            ssm_state = ssm_state * dA + dBx
+
+            # Subsequent output
+            # [bsz, n_groups * state_size] -> [bsz, num_heads, state_size]
+            C = C.reshape(batch_size, self.n_groups, -1)[..., None, :]
+            C = C.expand(batch_size, self.n_groups, self.num_heads // self.n_groups, C.shape[-1]).contiguous()
+            C = C.reshape(batch_size, -1, C.shape[-1])
+            # [bsz, num_heads, head_dim]
+
+            ssm_states_for_compute = ssm_state.to(device=C.device, dtype=C.dtype)  # Shape: [b, h, d, n]
+            # Reshape ssm_states to merge the first two dimensions
+            # Shape: [b*h, d, n]
+            ssm_states_reshaped = ssm_states_for_compute.view(batch_size * self.num_heads, self.head_dim, self.ssm_state_size)
+            C_reshaped = C.view(batch_size * self.num_heads, self.ssm_state_size, 1)  # Shape: [b*h, n, 1]
+            y = torch.bmm(ssm_states_reshaped, C_reshaped)
+            y = y.view(batch_size, self.num_heads, self.head_dim)
+
+            # D skip connection
+            # [num_heads] -> [num_heads, head_dim]
+            D = self._get_D(expand_to_head_dim=True)
+            y = (y + hidden_states * D).to(y.dtype)
+
+            # [bsz, num_heads, head_dim] -> [bsz, 1, intermediate_size]
+            y = y.reshape(batch_size, -1)[:, None, ...]
+
+            if self.rmsnorm:
+                scan_output = self.norm(y, gate)
+            else:
+                scan_output = y * self.act(gate)
+            contextualized_states = self.out_proj(scan_output.to(dtype))
+            return contextualized_states, conv_state, ssm_state
+        else:
+            # Prefill path
+            # begin ssd naive implementation without einsums
+            dt = nn.functional.softplus(dt + self.dt_bias)
+            dt = torch.clamp(dt, self.dt_limit[0], self.dt_limit[1])
+            hidden_states = hidden_states.reshape(batch_size, seq_len, -1, self.head_dim).float()
+            B = B.reshape(batch_size, seq_len, -1, self.ssm_state_size).float()
+            C = C.reshape(batch_size, seq_len, -1, self.ssm_state_size).float()
+            B = B.repeat(1, 1, self.num_heads // self.n_groups, 1)
+            C = C.repeat(1, 1, self.num_heads // self.n_groups, 1)
+            pad_size = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
+
+            D = self._get_D(expand_to_head_dim=True)
+            D_residual = D * pad_tensor_by_size(hidden_states, pad_size)
+
+            # Discretize x and A
+            hidden_states = hidden_states * dt[..., None]
+            A = A.to(hidden_states.dtype) * dt
+
+            # Rearrange into blocks/chunks
+            hidden_states, A, B, C = [reshape_into_chunks(t, pad_size, self.chunk_size) for t in (hidden_states, A, B, C)]
+
+            # [bsz, -1, chunk_size, num_heads] -> [bsz, num_heads, -1, chunk_size]
+            A = A.permute(0, 3, 1, 2)
+            A_cumsum = torch.cumsum(A, dim=-1)
+
+            # 1. Compute the output for each intra-chunk (diagonal blocks)
+            # This is the analog of a causal mask
+            L = torch.exp(segment_sum(A))
+
+            # Contraction of C and B to get G (attention-weights like)
+            # shape: (b, c, l, s, h, n)
+            G_intermediate = C[:, :, :, None, :, :] * B[:, :, None, :, :, :]
+            G = G_intermediate.sum(dim=-1)  # shape: (b, c, l, s, h)
+
+            # Compute M, equivalent to applying attention mask to weights
+            M_intermediate = G[..., None] * L.permute(0, 2, 3, 4, 1)[..., None]
+            M = M_intermediate.sum(dim=-1)
+
+            # Compute Y_diag (apply to values)
+            Y_diag = (M[..., None] * hidden_states[:, :, None]).sum(dim=3)
+
+            # 2. Compute the state for each intra-chunk
+            # (right term of low-rank factorization of off-diagonal blocks; B terms)
+            decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
+            B_decay = B * decay_states.permute(0, -2, -1, 1)[..., None]
+            states = (B_decay[..., None, :] * hidden_states[..., None]).sum(dim=2)
+
+            # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
+            # (middle term of factorization of off-diag blocks; A terms)
+            previous_states = torch.zeros_like(states[:, :1])
+            states = torch.cat([previous_states, states], dim=1)
+            decay_chunk = torch.exp(segment_sum(nn.functional.pad(A_cumsum[:, :, :, -1], (1, 0))))
+            decay_chunk = decay_chunk.transpose(1, 3)
+            new_states = (decay_chunk[..., None, None] * states[:, :, None, ...]).sum(dim=1)
+            states, ssm_state = new_states[:, :-1], new_states[:, -1]
+
+            # 4. Compute state -> output conversion per chunk
+            # (left term of low-rank factorization of off-diagonal blocks; C terms)
+            state_decay_out = torch.exp(A_cumsum)
+            C_times_states = (C[..., None, :] * states[:, :, None, ...])
+            state_decay_out_permuted = state_decay_out.permute(0, 2, 3, 1)
+            Y_off = (C_times_states.sum(-1) * state_decay_out_permuted[..., None])
+
+            # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
+            y = Y_diag + Y_off
+            # [bsz, -1, self.chunk_size, num_heads, head_dim] -> [bsz, (padded) seq_len, num_heads, head_dim]
+            y = y.reshape(batch_size, -1, self.num_heads, self.head_dim)
+
+            y = y + D_residual
+            # Cutting off padded chunks
+            if pad_size > 0:
+                y = y[:, :seq_len, :, :]
+            y = y.reshape(batch_size, seq_len, -1)
+
+            if self.rmsnorm:
+                scan_output = self.norm(y, gate)
+            else:
+                scan_output = y * self.act(gate)
+
+            # end ssd naive
+
+            # 4. Final linear projection
+            contextualized_states = self.out_proj(scan_output.to(dtype))  # [batch, seq_len, hidden_size]
+            return contextualized_states, new_conv_state if use_cache else None, ssm_state
+    # fmt: on
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        output_attentions: bool | None = False,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
+        if hidden_states.shape[1] == 0:
+            return hidden_states, None, past_key_values
+
+        last_state = get_layer_cache(self, past_key_values)
+
+        if is_fast_path_available and "cuda" in self.in_proj.weight.device.type:
+            output, conv_state, ssm_state = self.cuda_kernels_forward(hidden_states, last_state, use_cache, attention_mask)
+        else:
+            dtype = hidden_states.dtype
+            if last_state is None and attention_mask is not None and attention_mask.shape == hidden_states.shape[:2]:
+                hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+            output, conv_state, ssm_state = self.torch_forward(hidden_states, last_state, use_cache, attention_mask)
+
+        update_layer_cache(
+            self,
+            past_key_values,
+            recurrent_state=ssm_state,
+            conv_state=conv_state,
+            offset=hidden_states.shape[1],
+        )
+
+        return output, None, past_key_values

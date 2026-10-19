@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "If you use KronLSTM, please cite the paper below. The kernels are built on FLA; please cite FLA as well."
+type: software
+title: "KronLSTM"
+authors:
+- name: "NXAI GmbH"
+license: MIT
+repository-code: "https://github.com/NX-AI/KronLSTM"
+preferred-citation:
+  type: article
+  title: "Kronecker Delta Rule for Long Context Linear Attention"
+  authors:
+  - family-names: "Hartl"
+    given-names: "Anamaria-Roberta"
+  - family-names: "Zólyomi"
+    given-names: "Levente"
+  - family-names: "List"
+    given-names: "Michael"
+  - family-names: "Klambauer"
+    given-names: "Günter"
+  - family-names: "Böck"
+    given-names: "Sebastian"
+  - family-names: "Hochreiter"
+    given-names: "Sepp"
+  journal: "arXiv preprint"
+  url: "https://arxiv.org/abs/XXXX.XXXXX"
+  year: 2026
+references:
+- type: software
+  title: "FLA: A Triton-Based Library for Hardware-Efficient Implementations of Linear Attention Mechanism"
+  authors:
+  - family-names: "Yang"
+    given-names: "Songlin"
+    orcid: "https://orcid.org/0000-0002-5944-0110"
+  - family-names: "Zhang"
+    given-names: "Yu"
+    orcid: "https://orcid.org/0000-0002-8345-3835"
+  date-released: 2024-01-18
+  url: "https://github.com/fla-org/flash-linear-attention"

@@ -1,0 +1,495 @@
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
+
+import torch
+import triton
+import triton.language as tl
+
+from fla.ops.utils.op import unflatten_program_id
+from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+
+# Rebased: Linear Transformers with Learnable Kernel Functions are Better In-Context Models
+# https://github.com/corl-team/rebased/blob/main/flash_linear_attention/fla/ops/triton/rebased_fast/parallel.py
+
+
+@triton.jit(do_not_specialize=['T'])
+def parallel_rebased_fwd_kernel(
+    q,
+    k,
+    v,
+    o,
+    z,
+    scale,
+    T,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BTL: tl.constexpr,
+    BTS: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+):
+    # i_c: chunk index. used for sequence parallelism
+    i_kv, i_c = unflatten_program_id(tl.cdiv(K, BK) * tl.cdiv(V, BV))
+    i_bh = tl.program_id(1).to(tl.int64)
+    NV = tl.cdiv(V, BV)
+    i_k = i_kv // (NV)
+    i_v = i_kv % (NV)
+
+    o_t = i_c * BTL + tl.arange(0, BTL)
+    o_kk = i_k * BK + tl.arange(0, BK)
+    o_vv = i_v * BV + tl.arange(0, BV)
+    m_t = o_t < T
+    m_q = m_t[:, None] & (o_kk[None, :] < K)
+    m_o = m_t[:, None] & (o_vv[None, :] < V)
+    p_q = q + i_bh * T*K + o_t[:, None] * K + o_kk[None, :]
+
+    # [BQ, BD] block Q, in the shared memory throughout the whole kernel
+    b_q = tl.load(p_q, mask=m_q, other=0.0)
+    b_q = (b_q * scale).to(b_q.dtype)
+    b_o = tl.zeros([BTL, BV], dtype=tl.float32)
+    b_z = tl.zeros([BTL], dtype=tl.float32)
+
+    # Q block and K block have no overlap
+    # no need for mask, thereby saving flops
+    for i_s in range(0, i_c*BTL, BTS):
+        o_s = i_s + tl.arange(0, BTS)
+        m_k = (o_kk[:, None] < K) & (o_s[None, :] < T)
+        m_v = (o_s[:, None] < T) & (o_vv[None, :] < V)
+        p_k = k + i_bh * T*K + o_kk[:, None] + o_s[None, :] * K
+        p_v = v + i_bh * T*V + o_s[:, None] * V + o_vv[None, :]
+        # [BK, BTS]
+        b_k = tl.load(p_k, mask=m_k, other=0.0)
+
+        # [BTS, BV]
+        b_v = tl.load(p_v, mask=m_v, other=0.0)
+        # [BTL, BTS]
+        b_s = tl.dot(b_q, (b_k), allow_tf32=False)
+        b_s = b_s * b_s
+        b_z += tl.sum(b_s, axis=1)
+
+        # [BQ, BD]
+        b_o = tl.dot(b_s.to(b_v.dtype), b_v, b_o, allow_tf32=False)
+
+    # # rescale interchunk output
+    tl.debug_barrier()
+    o_q = tl.arange(0, BTL)
+    # # sync threads, easy for compiler to optimize
+    # tl.debug_barrier()
+
+    o_k = tl.arange(0, BTS)
+    # Q block and K block have overlap. masks required
+    for i_s in range(i_c*BTL, (i_c + 1) * BTL, BTS):
+        o_s = i_s + tl.arange(0, BTS)
+        m_k = (o_kk[:, None] < K) & (o_s[None, :] < T)
+        m_v = (o_s[:, None] < T) & (o_vv[None, :] < V)
+        p_k = k + i_bh * T*K + o_kk[:, None] + o_s[None, :] * K
+        p_v = v + i_bh * T*V + o_s[:, None] * V + o_vv[None, :]
+        # [BK, BTS]
+        b_k = tl.load(p_k, mask=m_k, other=0.0)
+        # [BTS, BV]
+        b_v = tl.load(p_v, mask=m_v, other=0.0)
+        # [BTL, BTS]
+        m_s = o_q[:, None] >= o_k[None, :]
+        b_s = tl.dot(b_q, b_k, allow_tf32=False)
+        b_s = b_s * b_s
+        b_s = tl.where(m_s, b_s, 0)
+        b_z += tl.sum(b_s, axis=1)
+        # [BTL, BV]
+        b_o = tl.dot(b_s.to(b_q.dtype), b_v, b_o, allow_tf32=False)
+        o_k += BTS
+
+    p_o = o + (i_bh + B * H * i_k) * T*V + o_t[:, None] * V + o_vv[None, :]
+    p_z = z + (i_bh + B * H * i_k) * T + i_c*BTL + tl.arange(0, BTL)
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_o)
+    tl.store(p_z, b_z.to(p_z.dtype.element_ty), mask=((i_c*BTL + tl.arange(0, BTL)) < T))
+
+
+@triton.jit(do_not_specialize=['T'])
+def _parallel_rebased_bwd_dq(
+    i_bh,
+    i_c,
+    i_k,
+    i_v,
+    i_h,
+    q,
+    k,
+    v,
+    do,
+    dz,
+    dq,
+    scale,
+    T,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BTL: tl.constexpr,
+    BTS: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+):
+    o_t = i_c * BTL + tl.arange(0, BTL)
+    o_kk = i_k * BK + tl.arange(0, BK)
+    o_vv = i_v * BV + tl.arange(0, BV)
+    m_t = o_t < T
+    m_q = m_t[:, None] & (o_kk[None, :] < K)
+    m_o = m_t[:, None] & (o_vv[None, :] < V)
+    p_do = do + i_bh * T*V + o_t[:, None] * V + o_vv[None, :]
+    p_q = q + (i_bh) * T*K + o_t[:, None] * K + o_kk[None, :]
+    b_q = tl.load(p_q, mask=m_q, other=0.0)
+    b_do = tl.load(p_do, mask=m_o, other=0.0).to(b_q.dtype)
+    b_q = (b_q * scale).to(b_q.dtype)
+    b_dq = tl.zeros([BTL, BK], dtype=tl.float32)
+    p_dz = dz + i_bh * T + i_c*BTL + tl.arange(0, BTL)
+    b_dz = tl.load(p_dz, mask=(i_c*BTL + tl.arange(0, BTL)) < T)
+
+    for i_s in range(0, i_c*BTL, BTS):
+        o_s = i_s + tl.arange(0, BTS)
+        m_k = (o_s[:, None] < T) & (o_kk[None, :] < K)
+        m_v = (o_vv[:, None] < V) & (o_s[None, :] < T)
+        p_k = k + i_bh * T*K + o_s[:, None] * K + o_kk[None, :]
+        p_v = v + i_bh * T*V + o_vv[:, None] + o_s[None, :] * V
+        # [BTS, BK]
+        b_k = tl.load(p_k, mask=m_k, other=0.0)
+        # [BV, BTS]
+        b_v = tl.load(p_v, mask=m_v, other=0.0)
+        # [BTL, BTS]
+        b_ds = tl.dot(b_do, b_v, allow_tf32=False)
+        if i_v == 0:
+            b_ds += b_dz[:, None]
+        else:
+            b_ds = b_ds
+        b_s = tl.dot(b_q, tl.trans(b_k), allow_tf32=False)
+        # [BQ, BD]
+        b_dq = tl.dot((2 * b_ds * b_s).to(b_v.dtype), b_k, b_dq, allow_tf32=False)
+
+    b_dq *= scale
+    o_q = tl.arange(0, BTL)
+    o_k = tl.arange(0, BTS)
+    # Q block and K block have overlap. masks required
+    for i_s in range(i_c*BTL, (i_c + 1) * BTL, BTS):
+        o_s = i_s + tl.arange(0, BTS)
+        m_k = (o_s[:, None] < T) & (o_kk[None, :] < K)
+        m_v = (o_vv[:, None] < V) & (o_s[None, :] < T)
+        p_k = k + i_bh * T*K + o_s[:, None] * K + o_kk[None, :]
+        p_v = v + i_bh * T*V + o_vv[:, None] + o_s[None, :] * V
+        # [BTS, BK]
+        b_k = tl.load(p_k, mask=m_k, other=0.0)
+        # [BV, BTS]
+        b_v = tl.load(p_v, mask=m_v, other=0.0)
+        # [BTL, BTS]
+        m_s = o_q[:, None] >= o_k[None, :]
+        b_ds = tl.dot(b_do, b_v, allow_tf32=False)
+        if i_v == 0:
+            b_ds += b_dz[:, None]
+        else:
+            b_ds = b_ds
+        b_ds = tl.where(m_s, b_ds, 0) * scale
+        b_s = tl.dot(b_q, tl.trans(b_k), allow_tf32=False)
+        b_s = tl.where(m_s, b_s, 0)
+        # [BTL, BK]
+        b_dq = tl.dot((2 * b_ds * b_s).to(b_k.dtype),
+                      b_k, b_dq, allow_tf32=False)
+        o_k += BTS
+    p_dq = dq + (i_bh + B * H * i_v) * T*K + o_t[:, None] * K + o_kk[None, :]
+    tl.store(p_dq, b_dq.to(p_dq.dtype.element_ty), mask=m_q)
+    return
+
+
+@triton.jit(do_not_specialize=['T'])
+def _parallel_rebased_bwd_dkv(
+    i_bh,
+    i_c,
+    i_k,
+    i_v,
+    i_h,
+    q,
+    k,
+    v,
+    do,
+    dz,
+    dk,
+    dv,
+    scale,
+    T,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BTL: tl.constexpr,
+    BTS: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+):
+    # compute dk dv
+    o_t = i_c * BTL + tl.arange(0, BTL)
+    o_kk = i_k * BK + tl.arange(0, BK)
+    o_vv = i_v * BV + tl.arange(0, BV)
+    m_t = o_t < T
+    m_k = m_t[:, None] & (o_kk[None, :] < K)
+    m_v = m_t[:, None] & (o_vv[None, :] < V)
+    p_k = k + i_bh * T*K + o_t[:, None] * K + o_kk[None, :]
+    p_v = v + i_bh * T*V + o_t[:, None] * V + o_vv[None, :]
+    b_k, b_v = tl.load(p_k, mask=m_k, other=0.0), tl.load(p_v, mask=m_v, other=0.0)
+    b_dk, b_dv = tl.zeros([BTL, BK], dtype=tl.float32), tl.zeros(
+        [BTL, BV], dtype=tl.float32)
+
+    for i in range((tl.cdiv(T, BTS) * BTS)-BTS, (i_c + 1) * BTL - BTS, -BTS):
+        o_s = i + tl.arange(0, BTS)
+        m_q = (o_kk[:, None] < K) & (o_s[None, :] < T)
+        m_o = (o_vv[:, None] < V) & (o_s[None, :] < T)
+        p_q = q + i_bh * T*K + o_kk[:, None] + o_s[None, :] * K
+        p_do = do + i_bh * T*V + o_vv[:, None] + o_s[None, :] * V
+        p_dz = dz + i_bh * T + i + tl.arange(0, BTS)
+        # [BK, BTS]
+        b_q = tl.load(p_q, mask=m_q, other=0.0)
+        # [BV, BTS]
+        b_do = tl.load(p_do, mask=m_o, other=0.0).to(b_q.dtype)
+        b_dz = tl.load(p_dz, mask=(i + tl.arange(0, BTS)) < T)
+        # [BTL, BTS]
+        b_s = tl.dot(b_k.to(b_q.dtype), b_q, allow_tf32=False) * scale
+        b_s2 = b_s * b_s
+        b_dv = tl.dot(b_s2.to(b_q.dtype), tl.trans(b_do), b_dv, allow_tf32=False)
+        b_ds = tl.dot(b_v, b_do, allow_tf32=False) * scale
+        if i_v == 0:
+            b_ds += b_dz[None, :] * scale
+        else:
+            b_ds = b_ds
+        b_dk = tl.dot((2 * b_ds * b_s).to(b_q.dtype), tl.trans(b_q), b_dk, allow_tf32=False)
+
+    tl.debug_barrier()
+    o_q, o_k = tl.arange(0, BTS), tl.arange(0, BTL)
+    for i in range(i_c*BTL, (i_c+1)*BTL, BTS):
+        o_s = i + tl.arange(0, BTS)
+        m_q = (o_kk[:, None] < K) & (o_s[None, :] < T)
+        m_o = (o_vv[:, None] < V) & (o_s[None, :] < T)
+        p_q = q + i_bh * T*K + o_kk[:, None] + o_s[None, :] * K
+        p_do = do + i_bh * T*V + o_vv[:, None] + o_s[None, :] * V
+        p_dz = dz + i_bh * T + i + tl.arange(0, BTS)
+        b_q = tl.load(p_q, mask=m_q, other=0.0)  # [BD, BQ]
+        b_do = tl.load(p_do, mask=m_o, other=0.0).to(b_q.dtype)
+        b_dz = tl.load(p_dz, mask=(i + tl.arange(0, BTS)) < T)
+        # [BK, BQ]
+        m_s = o_k[:, None] <= o_q[None, :]
+        b_s = tl.dot(b_k, b_q, allow_tf32=False) * scale
+        b_s2 = b_s * b_s
+        b_s = tl.where(m_s, b_s, 0)
+        b_s2 = tl.where(m_s, b_s2, 0)
+
+        b_ds = tl.dot(b_v, b_do, allow_tf32=False)
+        if i_v == 0:
+            b_ds += b_dz[None, :]
+        else:
+            b_ds = b_ds
+        b_ds = tl.where(m_s, b_ds, 0) * scale
+        # [BK, BD]
+        b_dv = tl.dot(b_s2.to(b_q.dtype), tl.trans(b_do), b_dv, allow_tf32=False)
+        b_dk = tl.dot((2 * b_ds * b_s).to(b_q.dtype), tl.trans(b_q), b_dk, allow_tf32=False)
+        o_q += BTS
+
+    p_dk = dk + (i_bh + B * H * i_v) * T*K + o_t[:, None] * K + o_kk[None, :]
+    p_dv = dv + (i_bh + B * H * i_k) * T*V + o_t[:, None] * V + o_vv[None, :]
+    tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), mask=m_k)
+    tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), mask=m_v)
+    return
+
+
+@triton.jit(do_not_specialize=['T'])
+def parallel_rebased_bwd_kernel(
+    q,
+    k,
+    v,
+    do,
+    dz,
+    dq,
+    dk,
+    dv,
+    scale,
+    T,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BTL: tl.constexpr,
+    BTS: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+):
+    i_kv, i_c = unflatten_program_id(tl.cdiv(K, BK) * tl.cdiv(V, BV))
+    i_bh = tl.program_id(1).to(tl.int64)
+    NV = tl.cdiv(V, BV)
+    i_k = i_kv // (NV)
+    i_v = i_kv % (NV)
+    i_h = i_bh % H
+    _parallel_rebased_bwd_dq(
+        i_bh,
+        i_c,
+        i_k,
+        i_v,
+        i_h,
+        q,
+        k,
+        v,
+        do,
+        dz,
+        dq,
+        scale,
+        B=B,
+        H=H,
+        T=T,
+        K=K,
+        V=V,
+        BTL=BTL,
+        BTS=BTS,
+        BK=BK,
+        BV=BV,
+    )
+    tl.debug_barrier()
+    _parallel_rebased_bwd_dkv(
+        i_bh,
+        i_c,
+        i_k,
+        i_v,
+        i_h,
+        q,
+        k,
+        v,
+        do,
+        dz,
+        dk,
+        dv,
+        scale,
+        B=B,
+        H=H,
+        T=T,
+        K=K,
+        V=V,
+        BTL=BTL,
+        BTS=BTS,
+        BK=BK,
+        BV=BV,
+    )
+
+
+class ParallelBasedFunction(torch.autograd.Function):
+
+    @staticmethod
+    @input_guard
+    @autocast_custom_fwd
+    def forward(ctx, q, k, v, scale):
+        BTL, BTS = 128, 32
+        assert BTL % BTS == 0
+        # assert q.shape[-1] % 16 == 0
+        BK = min(128, max(triton.next_power_of_2(k.shape[-1]), 16))
+        BV = min(128, max(triton.next_power_of_2(v.shape[-1]), 16))
+        B, H, T, K, V = *k.shape, v.shape[-1]
+        num_stages = 2
+        num_warps = 4
+        NK = triton.cdiv(K, BK)
+        NV = triton.cdiv(V, BV)
+        grid = (NK * NV * triton.cdiv(T, BTL), B * H)
+
+        assert NK == 1, "will encounter some synchronization issue if not."
+
+        o = torch.empty(NK, B, H, T, V, device=q.device)
+        z = torch.empty(NK, B, H, T, device=q.device)
+        parallel_rebased_fwd_kernel[grid](
+            q,
+            k,
+            v,
+            o,
+            z,
+            scale,
+            T=T,
+            B=B,
+            H=H,
+            K=K,
+            V=V,
+            BTL=BTL,
+            BTS=BTS,
+            BK=BK,
+            BV=BV,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        ctx.save_for_backward(q, k, v)
+        ctx.scale = scale
+        return o.sum(0).to(q.dtype), z.sum(0).to(q.dtype)
+
+    @staticmethod
+    @input_guard
+    @autocast_custom_bwd
+    def backward(ctx, do, dz):
+        q, k, v = ctx.saved_tensors
+        scale = ctx.scale
+        BTL, BTS = 64, 32
+        assert BTL % BTS == 0
+        BK = min(128, max(triton.next_power_of_2(k.shape[-1]), 16))
+        BV = min(128, max(triton.next_power_of_2(v.shape[-1]), 16))
+        B, H, T, K, V = *k.shape, v.shape[-1]
+        num_stages = 2
+        num_warps = 4
+        NK = triton.cdiv(K, BK)
+        NV = triton.cdiv(V, BV)
+        grid = (NK * NV * triton.cdiv(T, BTL), B * H)
+
+        assert NK == 1, "will encounter some synchronization issue if not"
+
+        dq = torch.empty(NV, B, H, T, K, dtype=q.dtype, device=q.device)
+        dk = torch.empty(NV, B, H, T, K, dtype=q.dtype, device=q.device)
+        dv = torch.empty(NK, B, H, T, V, dtype=q.dtype, device=q.device)
+
+        parallel_rebased_bwd_kernel[grid](
+            q,
+            k,
+            v,
+            do,
+            dz,
+            dq,
+            dk,
+            dv,
+            scale,
+            T=T,
+            B=B,
+            H=H,
+            K=K,
+            V=V,
+            BTL=BTL,
+            BTS=BTS,
+            BK=BK,
+            BV=BV,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+
+        return dq.sum(0).to(q.dtype), dk.sum(0).to(k.dtype), dv.sum(0).to(v.dtype), None
+
+
+def parallel_rebased(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    eps: float = 1e-5,
+    use_scale: bool = True,
+    use_normalize: bool = True,
+    return_both: bool = False,
+):
+    assert q.shape[-1] <= 128, "only support feature dim up to 128"
+    if use_scale:
+        scale = q.shape[-1] ** -0.5
+    else:
+        scale = 1
+    q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
+    o, z = ParallelBasedFunction.apply(q, k, v, scale)
+    if return_both:
+        return o, z
+    if use_normalize:
+        o = o / (z[..., None] + eps)
+    o = o.transpose(1, 2)
+    return o.to(q.dtype)

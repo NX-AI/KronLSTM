@@ -1,0 +1,154 @@
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
+
+import torch
+import triton
+import triton.language as tl
+
+from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
+from fla.utils import check_shared_mem
+
+
+@triton.heuristics({
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
+})
+@triton.jit(do_not_specialize=['T'])
+def chunk_cumprod_householder_bwd_kernel(
+    hc_suffix, dhc_whole,
+    k, dk, w1, w2, dw1, dw2, dk_new,
+    cu_seqlens, split_indices, chunk_offsets, split_offsets,
+    BT: tl.constexpr,  # previous small chunk size
+    K: tl.constexpr,
+    BK: tl.constexpr,
+    T,
+    S: tl.constexpr,
+    G: tl.constexpr,
+    H: tl.constexpr,
+    HQ: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    i_ss, i_hq = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
+    i_h = i_hq // G
+
+    if IS_VARLEN:
+        i_n, i_s = tl.load(split_indices + i_ss * 2).to(tl.int32), tl.load(split_indices + i_ss * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+        T = (eos - bos).to(tl.int32)
+        NS = tl.cdiv(T, S)
+        boh = tl.load(chunk_offsets + i_n).to(tl.int64)
+        boh_large = tl.load(split_offsets + i_n).to(tl.int64)
+    else:
+        NS = tl.cdiv(T, S)
+        i_n, i_s = i_ss // NS, i_ss % NS
+        bos, eos = (i_n * T).to(tl.int64), (i_n * T + T).to(tl.int64)
+        boh = (i_n * tl.cdiv(T, BT)).to(tl.int64)
+        boh_large = (i_n * tl.cdiv(T, S)).to(tl.int64)
+
+    # offset calculations
+    dhc_whole += ((boh_large + i_s) * HQ + i_hq) * K * K
+    hc_suffix += ((boh + tl.cdiv(i_s * S, BT)) * H + i_h) * K * K
+    k += (bos * H + i_h) * K
+    w1 += (bos * H + i_h) * K
+    w2 += (bos * H + i_h) * K
+    dw1 += (bos * HQ + i_hq) * K
+    dw2 += (bos * HQ + i_hq) * K
+
+    # dh += ((boh + tl.cdiv(i_s * S, BT)) * HQ + i_hq) * K * K
+    dk += (bos * HQ + i_hq) * K
+    dk_new += (bos * HQ + i_hq) * K
+
+    stride_h = H * K * K
+    NT_small = tl.cdiv(min(S, T-i_s*S), BT)
+    o_d = tl.arange(0, BK)
+    m_d = o_d < K
+    p_dhc_whole = dhc_whole + o_d[:, None] * K + o_d[None, :]
+    b_dhc = tl.zeros([BK, BK], dtype=tl.float32)
+    b_dhc += tl.load(p_dhc_whole, mask=m_d[:, None] & m_d[None, :], other=0.0)
+
+    # calculate dh
+    for i_t_small in range(0, NT_small):
+        o_k = (i_s*S + i_t_small*BT).to(tl.int64) + tl.arange(0, BT)
+        m_k = o_k < T
+        m_kk = m_k[:, None] & m_d[None, :]
+        p_k = k + o_k[:, None] * (H*K) + o_d[None, :]
+        p_dk = dk + o_k[:, None] * (HQ*K) + o_d[None, :]
+        p_dk_new = dk_new + o_k[:, None] * (HQ*K) + o_d[None, :]
+        p_hc = hc_suffix + i_t_small * stride_h + o_d[:, None] * K + o_d[None, :]
+
+        b_k = tl.load(p_k, mask=m_kk, other=0.0)
+        b_dk = tl.load(p_dk, mask=m_kk, other=0.0)
+
+        p_w1 = w1 + o_k[:, None] * (H*K) + o_d[None, :]
+        p_w2 = w2 + o_k[:, None] * (H*K) + o_d[None, :]
+
+        b_w1 = tl.load(p_w1, mask=m_kk, other=0.0)
+        b_w2 = tl.load(p_w2, mask=m_kk, other=0.0)
+        b_hc = tl.load(p_hc, mask=m_d[:, None] & m_d[None, :], other=0.0)
+
+        b_dk_new = b_dk - tl.dot(b_dk.to(b_hc.dtype), b_hc)
+        tl.store(p_dk_new, b_dk_new.to(dk_new.dtype.element_ty), mask=m_kk)
+
+        b_dh = b_dhc - tl.dot(tl.trans(b_hc), b_dhc.to(b_hc.dtype))
+        b_dw2 = tl.dot(b_w1, b_dh.to(b_w1.dtype))
+        b_dw1 = tl.dot(b_w2, tl.trans(b_dh.to(b_w2.dtype)))
+
+        p_dw1 = dw1 + o_k[:, None] * (HQ*K) + o_d[None, :]
+        p_dw2 = dw2 + o_k[:, None] * (HQ*K) + o_d[None, :]
+
+        tl.store(p_dw1, b_dw1.to(dw1.dtype.element_ty), mask=m_kk)
+        tl.store(p_dw2, b_dw2.to(dw2.dtype.element_ty), mask=m_kk)
+
+        b_dhc = b_dhc - tl.dot(tl.dot(b_dhc.to(b_w2.dtype), tl.trans(b_w2)).to(b_w1.dtype), b_w1)
+        b_dhc -= tl.dot(tl.trans(b_dk).to(b_k.dtype), b_k)
+
+
+def chunk_cumprod_householder_bwd_fn(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    hc_suffix: torch.Tensor,
+    dhc_whole: torch.Tensor,
+    k: torch.Tensor,
+    dk: torch.Tensor,
+    S: int,  # split size, aka large chunk size
+    BT: int,  # small chunk size
+    cu_seqlens: torch.Tensor = None,
+    chunk_indices: torch.LongTensor | None = None,
+):
+    B, T, HQ, K = dk.shape
+    H = k.shape[2]
+    G = HQ // H
+
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, S)
+    split_indices = chunk_indices
+    chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT) if cu_seqlens is not None else None
+    split_offsets = prepare_chunk_offsets(cu_seqlens, S) if cu_seqlens is not None else None
+
+    if cu_seqlens is None:
+        N = B
+        NS = N * triton.cdiv(T, S)
+    else:
+        N = len(cu_seqlens) - 1
+        NS = split_offsets[-1].item()
+
+    grid = (NS, HQ)
+    dw1 = torch.empty_like(dk, dtype=torch.float32)
+    dw2 = torch.empty_like(dk, dtype=torch.float32)
+    dk_new = torch.empty_like(dk, dtype=torch.float32)
+
+    chunk_cumprod_householder_bwd_kernel[grid](
+        hc_suffix=hc_suffix, dhc_whole=dhc_whole,
+        k=k, dk=dk, w1=w1, w2=w2, dw1=dw1, dw2=dw2, dk_new=dk_new,
+        cu_seqlens=cu_seqlens,
+        split_indices=split_indices, chunk_offsets=chunk_offsets, split_offsets=split_offsets,
+        BT=BT, K=K, G=G, H=H, HQ=HQ, BK=K,
+        T=T, S=S,
+        # SY (2025/07/08): I don't know why when K == 128 if I set num_warps=4 the result would be completely wrong
+        num_warps=8 if K == 128 else 4,
+        num_stages=2 if check_shared_mem('ampere') else 1,
+    )
+    return dw1, dw2, dk_new
