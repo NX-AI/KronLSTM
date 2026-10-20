@@ -182,4 +182,4 @@ The reverse scan mirrors the forward's coupling: the value cotangent becomes one
 - With fp32 inputs, `chunk_kronlstm` needs $K\le 128$ or $V\le 128$: the scan keeps its state in registers but stages each 64-row block in shared memory as a `tl.dot` operand, in the inputs' dtype, and in fp32 the state of $K=V=256$ takes 320 KB. The layer hands the op q, k and v in the projections' dtype, so under bf16 autocast it runs the bf16 kernels.
 - `fused_recurrent_kronlstm` is forward-only; training uses `chunk_kronlstm`.
 
-[^1]: A.-R. Hartl, L. Zólyomi, M. List, G. Klambauer, S. Böck, S. Hochreiter. *Kronecker Delta Rule for Long Context Linear Attention*, 2026. https://arxiv.org/abs/XXXX.XXXXX (placeholder until the preprint is public).
+[^1]: A.-R. Hartl, L. Zólyomi, M. List, G. Klambauer, S. Böck, S. Hochreiter. *Kronecker Delta Rule for Long Context Linear Attention*, 2026. https://arxiv.org/abs/2610.26834.

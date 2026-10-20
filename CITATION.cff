@@ -23,7 +23,7 @@ preferred-citation:
   - family-names: "Hochreiter"
     given-names: "Sepp"
   journal: "arXiv preprint"
-  url: "https://arxiv.org/abs/XXXX.XXXXX"
+  url: "https://arxiv.org/abs/2610.26834"
   year: 2026
 references:
 - type: software

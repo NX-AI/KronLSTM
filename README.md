@@ -1,9 +1,9 @@
 # KronLSTM
 
-[![arXiv](https://img.shields.io/badge/arXiv-XXXX.XXXXX-b31b1b.svg)](https://arxiv.org/abs/XXXX.XXXXX)
+[![arXiv](https://img.shields.io/badge/arXiv-2610.26834-b31b1b.svg)](https://arxiv.org/abs/2610.26834)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Triton kernels and a PyTorch layer for KronLSTM, from the paper *Kronecker Delta Rule for Long Context Linear Attention* ([arXiv:XXXX.XXXXX](https://arxiv.org/abs/XXXX.XXXXX)).
+Triton kernels and a PyTorch layer for KronLSTM, from the paper *Kronecker Delta Rule for Long Context Linear Attention* ([arXiv:2610.26834](https://arxiv.org/abs/2610.26834)).
 
 <p align="center">
   <img src="kronlstm-memory.gif" width="50%" alt="Animation of one new value written into three memories. In mLSTM the write disturbs every stored value; in Gated DeltaNet it erases the values that share the new key; in KronLSTM it changes only the overlapping key and value pair, so stored memories survive long contexts.">
@@ -145,7 +145,7 @@ If you use KronLSTM, please cite the paper, and FLA, which the kernels are built
 @article{hartl2026kronlstm,
   title   = {Kronecker Delta Rule for Long Context Linear Attention},
   author  = {Hartl, Anamaria-Roberta and Z{\'o}lyomi, Levente and List, Michael and Klambauer, G{\"u}nter and B{\"o}ck, Sebastian and Hochreiter, Sepp},
-  journal = {arXiv preprint arXiv:XXXX.XXXXX},
+  journal = {arXiv preprint arXiv:2610.26834},
   year    = {2026}
 }
 

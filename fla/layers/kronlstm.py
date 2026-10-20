@@ -58,7 +58,7 @@ class KronLSTM(nn.Module):
     `s = 2` under `allow_neg_eigval` and 1 otherwise,
     and GDN-2's channel-wise decay `g_t = -exp(A_log) * softplus(f(x_t) + dt_bias)`.
     Under `decouple_erase` the learnt `beta` comes off the write and gates the erase only.
-    See `fla/ops/kronlstm/README.md` and the KronLSTM paper (https://arxiv.org/abs/XXXX.XXXXX).
+    See `fla/ops/kronlstm/README.md` and the KronLSTM paper (https://arxiv.org/abs/2610.26834).
 
     The projections keep `nn.Linear`'s init: a model or training framework initialises them with its own scheme
     and then calls `reset_gate_parameters` for the parameters whose init is the layer's own.
